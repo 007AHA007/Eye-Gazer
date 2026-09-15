@@ -1,0 +1,6 @@
+{
+  "name": "Gaze Reader",
+  "description": "A web app for reading long documents with gaze-based auto-scrolling.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
