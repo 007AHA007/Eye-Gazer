@@ -14,7 +14,8 @@ import {
   seedWebgazerBaseline,
   lockInitial2DCalibration,
   startFullRecalibration,
-  compute2DHeadReferencedGaze
+  compute2DHeadReferencedGaze,
+  sampleHeadPose
 } from './lib/headPoseTracker';
 
 // Extend window object for webgazer & custom gaze tracking state
@@ -56,6 +57,7 @@ declare global {
 export default function App() {
   const [appState, setAppState] = useState<AppState>('IDLE');
   const [isWebgazerLoaded, setIsWebgazerLoaded] = useState(false);
+  const [isStartingCamera, setIsStartingCamera] = useState(false);
   const [loadingError, setLoadingError] = useState<string | null>(null);
   const scrollTimeoutRef = useRef<number | null>(null);
   const gazeFilterRef = useRef<DualAxisFilter>(new DualAxisFilter(0.5, 0.004));
@@ -130,9 +132,9 @@ export default function App() {
   }, []);
 
   const startTracking = async () => {
-    if (!window.webgazer) return;
+    if (!window.webgazer || isStartingCamera) return;
     
-    setAppState('CALIBRATING');
+    setIsStartingCamera(true);
     setLoadingError(null);
     
     try {
@@ -141,7 +143,8 @@ export default function App() {
       if (typeof window.webgazer.setTracker === 'function') {
         window.webgazer.setTracker("TFFacemesh");
       }
-      // Seed baseline anchor points so predict() immediately returns live coordinates
+      // Seed 1 initial point so WebGazer's video/prediction loop starts immediately;
+      // CalibrationScreen wipes this temporary point on the user's first calibration click.
       seedWebgazerBaseline();
 
       await window.webgazer
@@ -170,6 +173,10 @@ export default function App() {
             trackingSource: 'hybrid',
             isPaused: false,
           };
+
+          // Always sample FaceMesh landmarks on every frame (even if pupil `data` is null during eyelid closure)
+          // so Eye Aspect Ratio (EAR) double-blink detection never misses a closed-eye frame.
+          sampleHeadPose();
 
           let rawTargetX: number | null = null;
           let rawTargetY: number | null = null;
@@ -205,18 +212,18 @@ export default function App() {
             }
           }
 
-          // Blink detection or signal loss
+          const now = performance.now();
+
+          // Signal loss protection (freeze gaze cursor during brief tracking drops without firing false blink gestures)
           if (rawTargetX === null || rawTargetY === null || isNaN(rawTargetX) || isNaN(rawTargetY)) {
             if (!window._gazeState.isBlinking) {
               window._gazeState.isBlinking = true;
-              window._gazeState.blinkStartTime = Date.now();
+              window._gazeState.blinkStartTime = now;
             }
             return;
-          } else {
+          } else if (window._gazeState.isBlinking) {
             window._gazeState.isBlinking = false;
           }
-
-          const now = performance.now();
 
           // 1. Calculate eye movement velocity & position-based center stability
           const motion = rawMotionRef.current;
@@ -226,7 +233,7 @@ export default function App() {
             const dist = Math.hypot(rawTargetX - motion.lastX, rawTargetY - motion.lastY);
             const instVelocity = dist / dtVelocity; // pixels per second
             // Smooth velocity with leaky moving average to reject single-frame tracking noise
-            motion.smoothedVelocity = (instVelocity * 0.35) + (motion.smoothedVelocity * 0.65);
+            motion.smoothedVelocity = (instVelocity * 0.40) + (motion.smoothedVelocity * 0.60);
             currentVelocity = motion.smoothedVelocity;
           }
           motion.lastX = rawTargetX;
@@ -234,19 +241,18 @@ export default function App() {
           motion.lastTime = now;
 
           // 2. Normalized velocity scale: 0 = stationary reading fixation, 1 = rapid saccade / glance
-          const speedNorm = Math.min(1.0, currentVelocity / 950.0);
+          const speedNorm = Math.min(1.0, currentVelocity / 800.0);
 
           // 3. Screen Center Proximity (1.0 at screen center, 0.0 near top/bottom scroll margins)
           const screenHeight = window.innerHeight || 800;
           const distFromCenterNorm = Math.min(1.0, Math.abs(rawTargetY - (screenHeight * 0.5)) / (screenHeight * 0.5));
-          // Quadratic ease: creates a wide, calm sweet spot across the central reading corridor
+          // Quadratic ease: creates a calm sweet spot across the central reading corridor
           const centerReadingFactor = Math.max(0.0, 1.0 - Math.pow(distFromCenterNorm / 0.70, 2));
 
           // 4. Dynamically compute One-Euro filter minCutoff and beta:
-          // Center reading at low velocity: minCutoff = 0.65 Hz, beta = 0.0045 (solid stability)
-          // Margins or rapid saccades: minCutoff up to 3.2 Hz, beta up to 0.03 (lightning-fast response for scrolling)
-          const dynamicMinCutoff = 0.65 + (1.20 * (1.0 - centerReadingFactor)) + (1.35 * speedNorm);
-          const dynamicBeta = 0.0045 + (0.008 * (1.0 - centerReadingFactor)) + (0.018 * speedNorm);
+          // Balanced for crisp, zero-lag responsiveness while suppressing stationary fixation tremor
+          const dynamicMinCutoff = 1.15 + (1.35 * (1.0 - centerReadingFactor)) + (1.85 * speedNorm);
+          const dynamicBeta = 0.008 + (0.010 * (1.0 - centerReadingFactor)) + (0.022 * speedNorm);
 
           // Adaptive One-Euro Filter with dynamically calculated constants
           const filtered = gazeFilterRef.current.filter(rawTargetX, rawTargetY, now, dynamicMinCutoff, dynamicBeta);
@@ -268,7 +274,21 @@ export default function App() {
           if (document.getElementById('reader-mode-active') && !isPaused) {
             
             const bottomPct = currentSettings.bottomThresholdPct ?? 0.22;
-            const topPct = currentSettings.topThresholdPct ?? 0.18;
+            const baseTopPct = currentSettings.topThresholdPct ?? 0.18;
+
+            // If user leans back from calibrated distance, automatically expand the top scroll zone
+            // by up to +6% of viewport height so looking up while reclined triggers effortlessly
+            const ht = window._headTrackerState;
+            const faceScaleRatio =
+              ht?.currentHead && ht?.calibration
+                ? ht.currentHead.faceSize / Math.max(10, ht.calibration.faceSize)
+                : 1.0;
+            const leanBackBonusPct =
+              faceScaleRatio < 0.96
+                ? Math.min(0.06, (0.96 - faceScaleRatio) * 0.35)
+                : 0;
+            const topPct = Math.min(0.32, baseTopPct + leanBackBonusPct);
+
             const bottomThreshold = screenHeight * (1 - bottomPct);
             const topThreshold = screenHeight * topPct;
             const scrollMode = currentSettings.scrollMode ?? 'step';
@@ -283,7 +303,7 @@ export default function App() {
 
             const isCooldown = (window._gazeState.scrollCooldownUntil || 0) > now;
             const currentScrollY = window.scrollY || document.documentElement.scrollTop || 0;
-            const canScrollUp = currentScrollY > 10;
+            const canScrollUp = currentScrollY > 4;
             
             // Allow scroll trigger anywhere across reading viewport (protect controls only deep in sidebar x < 180)
             const isInsideSidebar = currentX < 180;
@@ -291,8 +311,9 @@ export default function App() {
             const inRetreatZone = !isInsideSidebar && currentY < topThreshold && canScrollUp;
 
             if (scrollMode === 'step') {
-              // Deliberate 500ms dwell at 1.0x speed, scales inversely with user scroll speed setting
+              // Deliberate 500ms dwell at 1.0x speed, with 24% faster charge for top scroll-up
               const baseDwellSec = Math.max(0.35, 0.50 / speedMultiplier);
+              const topDwellSec = Math.max(0.26, baseDwellSec * 0.76);
 
               if (inAdvanceZone && !isCooldown) {
                 // Charge bottom accumulator
@@ -310,10 +331,10 @@ export default function App() {
                   indicator.style.boxShadow = '0 0 10px rgba(34, 197, 94, 0.7)';
                 }
               } else if (inRetreatZone && !isCooldown) {
-                // Charge top accumulator
+                // Charge top accumulator faster so upward glances while reclined feel effortless
                 window._gazeState.topDwellAccumulator = Math.min(
                   1.0, 
-                  (window._gazeState.topDwellAccumulator || 0) + (dt / baseDwellSec)
+                  (window._gazeState.topDwellAccumulator || 0) + (dt / topDwellSec)
                 );
                 // Drain opposing bottom accumulator
                 window._gazeState.bottomDwellAccumulator = Math.max(
@@ -326,14 +347,14 @@ export default function App() {
                 }
               } else {
                 // In neutral reading corridor or sidebar:
-                // Forgiving decay so natural reading saccades or micro-blinks don't harsh-wipe progress
+                // Gentle decay on top accumulator so brief vertical jitter while reclined never wipes progress
                 window._gazeState.bottomDwellAccumulator = Math.max(
                   0, 
                   (window._gazeState.bottomDwellAccumulator || 0) - (dt * 1.1 / baseDwellSec)
                 );
                 window._gazeState.topDwellAccumulator = Math.max(
                   0, 
-                  (window._gazeState.topDwellAccumulator || 0) - (dt * 1.1 / baseDwellSec)
+                  (window._gazeState.topDwellAccumulator || 0) - (dt * 0.70 / topDwellSec)
                 );
                 if (indicator) {
                   indicator.style.backgroundColor = '';
@@ -376,7 +397,7 @@ export default function App() {
                 const retreatAmount = Math.round(Math.min(screenHeight * 0.40, 240 * Math.max(0.7, speedMultiplier)));
                 window.scrollBy({ top: -retreatAmount, behavior: 'smooth' });
                 window._gazeState.topDwellAccumulator = 0;
-                window._gazeState.scrollCooldownUntil = now + Math.max(550, 750 / speedMultiplier);
+                window._gazeState.scrollCooldownUntil = now + Math.max(500, 680 / speedMultiplier);
                 if (topDwellProgressEl) {
                   topDwellProgressEl.style.width = '100%';
                   setTimeout(() => {
@@ -408,8 +429,9 @@ export default function App() {
                 }
               } else if (inRetreatZone) {
                 const depth = Math.min(1, Math.max(0, (topThreshold - currentY) / Math.max(20, topThreshold)));
-                const smoothDepth = depth * depth;
-                const scrollPixels = smoothDepth * (maxVelocityPxPerSec * 0.9) * dt;
+                // Blend linear + quadratic so shallow upward entry while leaned back immediately glides up
+                const smoothDepth = 0.35 * depth + 0.65 * depth * depth;
+                const scrollPixels = smoothDepth * (maxVelocityPxPerSec * 1.15) * dt;
 
                 window._gazeState.subpixelScrollY = (window._gazeState.subpixelScrollY || 0) - scrollPixels;
                 const intPixels = Math.trunc(window._gazeState.subpixelScrollY);
@@ -433,7 +455,7 @@ export default function App() {
               if (topDwellProgressEl) topDwellProgressEl.style.opacity = '0';
             }
 
-            // 2. Button Dwell Logic for Sidebar Action Controls
+            // 2. Button Dwell Logic for Sidebar & Margin Action Controls
             if (indicator) indicator.style.pointerEvents = 'none';
             const hoveredElement = document.elementFromPoint(currentX, currentY);
             const targetBtn = hoveredElement?.closest('[data-gaze-action]') as HTMLElement | null;
@@ -462,14 +484,18 @@ export default function App() {
 
                 // ~30 frames corresponds to approx 500ms of steady intentional glance
                 if (window._gazeState.dwellFrames > 30 && !scrollTimeoutRef.current) {
-                  const action = targetBtn.getAttribute('data-gaze-action');
-                  const isDown = action === 'scroll-down' || targetId.includes('down');
-                  const scrollAmount = Math.min(window.innerHeight * 0.45, 260);
-                  
-                  window.scrollBy({ 
-                    top: isDown ? scrollAmount : -scrollAmount, 
-                    behavior: 'smooth' 
-                  });
+                  const action = targetBtn.getAttribute('data-gaze-action') || '';
+                  if (action.startsWith('bookmark-')) {
+                    targetBtn.click();
+                  } else {
+                    const isDown = action === 'scroll-down' || action === 'down' || targetId.includes('down');
+                    const scrollAmount = Math.min(window.innerHeight * 0.45, 260);
+                    
+                    window.scrollBy({ 
+                      top: isDown ? scrollAmount : -scrollAmount, 
+                      behavior: 'smooth' 
+                    });
+                  }
                   
                   targetBtn.classList.add('brightness-125');
                   setTimeout(() => targetBtn.classList.remove('brightness-125'), 350);
@@ -498,12 +524,21 @@ export default function App() {
           window.webgazer.removeMouseEventListeners();
         }
 
-        // Hide standard webgazer prediction points during calibration or show as needed
+        // Show webgazer video preview during calibration
         window.webgazer.showVideoPreview(true).showPredictionPoints(true);
+        if (
+          document.getElementById('webgazerVideoContainer') &&
+          typeof window.webgazer.setVideoViewerSize === 'function'
+        ) {
+          window.webgazer.setVideoViewerSize(320, 240);
+        }
+        setIsStartingCamera(false);
+        setAppState('CALIBRATING');
     } catch (err: any) {
       console.error("Failed to start webgazer:", err);
+      setIsStartingCamera(false);
       setAppState('IDLE');
-      setLoadingError("Camera permission denied. Please click the icon in your address bar to allow camera access, then try again.");
+      setLoadingError("Camera access failed or is busy. Please ensure camera permission is allowed in your browser address bar, then click below to retry.");
       
       try {
         if (window.webgazer) {
@@ -520,8 +555,6 @@ export default function App() {
     if (typeof window.webgazer?.removeMouseEventListeners === 'function') {
       window.webgazer.removeMouseEventListeners();
     }
-    // Lock the 2D Head Reference Point at completion of 9-point calibration
-    lockInitial2DCalibration();
     setAppState('READING');
     rawMotionRef.current = { lastX: 0, lastY: 0, lastTime: 0, smoothedVelocity: 0 };
     gazeFilterRef.current.reset();
@@ -554,11 +587,13 @@ export default function App() {
               </ul>
             </div>
             
-            {loadingError ? (
-              <div className="p-4 bg-red-50 text-red-600 rounded-xl text-sm border border-red-200 mb-4">
+            {loadingError && (
+              <div className="p-3.5 bg-red-50 text-red-600 rounded-xl text-xs border border-red-200 mb-4 text-left">
                 {loadingError}
               </div>
-            ) : !isWebgazerLoaded ? (
+            )}
+
+            {!isWebgazerLoaded ? (
               <div className="flex items-center justify-center gap-2.5 text-stone-500 py-3 text-sm">
                 <div className="w-4 h-4 border-2 border-stone-300 border-t-blue-600 rounded-full animate-spin" />
                 Loading Eye-Tracking Engine...
@@ -566,9 +601,17 @@ export default function App() {
             ) : (
               <button
                 onClick={startTracking}
-                className="w-full py-3.5 px-5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-semibold text-sm transition-all shadow-md hover:shadow-lg active:scale-[0.99] cursor-pointer"
+                disabled={isStartingCamera}
+                className="w-full py-3.5 px-5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-500 text-white rounded-xl font-semibold text-sm transition-all shadow-md hover:shadow-lg active:scale-[0.99] cursor-pointer flex items-center justify-center gap-2.5"
               >
-                Enable Camera & Calibrate
+                {isStartingCamera ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    <span>Initializing Camera & FaceMesh...</span>
+                  </>
+                ) : (
+                  <span>{loadingError ? 'Retry Camera & Calibrate' : 'Enable Camera & Calibrate'}</span>
+                )}
               </button>
             )}
             
@@ -590,7 +633,7 @@ export default function App() {
       if (typeof window.webgazer.removeMouseEventListeners === 'function') {
         window.webgazer.removeMouseEventListeners();
       }
-      // Step A & B: Wipe WebGazer old regressions and 2D Head Reference state so they don't fight new calibration
+      // Wipe WebGazer old regressions and 2D Head Reference state cleanly
       startFullRecalibration();
       seedWebgazerBaseline();
       rawMotionRef.current = { lastX: 0, lastY: 0, lastTime: 0, smoothedVelocity: 0 };
@@ -604,10 +647,13 @@ export default function App() {
         window._gazeState.topDwellAccumulator = 0;
         window._gazeState.subpixelScrollY = 0;
       }
-      if (typeof window.webgazer.setVideoViewerSize === 'function') {
+      window.webgazer.showVideoPreview(true).showPredictionPoints(true);
+      if (
+        document.getElementById('webgazerVideoContainer') &&
+        typeof window.webgazer.setVideoViewerSize === 'function'
+      ) {
         window.webgazer.setVideoViewerSize(320, 240);
       }
-      window.webgazer.showVideoPreview(true).showPredictionPoints(true);
       setAppState('CALIBRATING');
     }
   };
