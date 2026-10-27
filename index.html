@@ -8,8 +8,10 @@
     <meta property="og:title" content="Gaze Reader" />
     <meta property="og:description" content="A web app for reading long documents with gaze-based auto-scrolling." />
     <meta property="og:type" content="website" />
-    <meta name="twitter:card" content="summary_large_image" />
-    <script src="https://cdn.jsdelivr.net/npm/webgazer@3.3.0/dist/webgazer.js" crossorigin="anonymous"></script>
+    <!-- MediaPipe FaceMesh dependencies served locally to prevent locateFile 404s and TypeError -->
+    <script src="/face_mesh_solution_packed_assets_loader.js"></script>
+    <script src="/face_mesh_solution_wasm_bin.js"></script>
+    <script src="/webgazer.js"></script>
   </head>
   <body>
     <div id="root"></div>
